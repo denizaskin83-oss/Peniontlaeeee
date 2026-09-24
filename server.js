@@ -29,13 +29,18 @@ const players = new Map();
 // ---- Kalıcı dünya durumu (disk üzerinde JSON dosyası) ----
 const STATE_FILE = path.join(__dirname, 'world-state.json');
 const MAX_SIGNS = 40;
+const MAX_NPCS = 20;
+const MAX_PHOTOS = 15;
 const MAX_LOG = 60;
+const MAX_PHOTO_BYTES = 180000; // ~180KB base64
 
 let world = {
   isNight: false,
   collectedStars: Object.create(null),
-  signs: [],        // [{id, text, x, y, ts}]  -> AI'nin oyuna eklediği kalıcı ilan panoları
-  adminLog: []       // [{ts, cmd, resultSummary}] -> panelde geçmişi görmek için
+  signs: [],
+  customNpcs: [],   // [{id,name,x,y,color,lines,letter}]
+  photos: [],       // [{id,x,y,dataUrl,caption}]
+  adminLog: []
 };
 
 function loadWorld() {
@@ -45,6 +50,8 @@ function loadWorld() {
     world.isNight = !!saved.isNight;
     world.collectedStars = saved.collectedStars || Object.create(null);
     world.signs = Array.isArray(saved.signs) ? saved.signs : [];
+    world.customNpcs = Array.isArray(saved.customNpcs) ? saved.customNpcs : [];
+    world.photos = Array.isArray(saved.photos) ? saved.photos : [];
     world.adminLog = Array.isArray(saved.adminLog) ? saved.adminLog : [];
   } catch (e) {
     // Dosya yok veya bozuk — sıfırdan başla.
@@ -97,6 +104,55 @@ function clearSigns(){
   saveWorld();
   io.emit('world:signsCleared');
 }
+
+function addCustomNpc(data){
+  const name = cleanText(data.name || 'Yeni', 24) || 'Yeni';
+  const lines = Array.isArray(data.lines) ? data.lines.map(l => cleanText(l, 120)).filter(Boolean).slice(0, 6) : [];
+  if (!lines.length) lines.push(name + ' burada.');
+  const letter = cleanText(data.letter || name.charAt(0), 2) || '?';
+  const color = cleanText(data.color || '#a29bfe', 20) || '#a29bfe';
+  const npc = {
+    id: 'n' + Date.now().toString(36) + Math.random().toString(36).slice(2,5),
+    name, letter, color, lines,
+    x: clamp(data.x != null ? data.x : (400 + Math.random()*400), 80, MAP_W - 80),
+    y: clamp(data.y != null ? data.y : (200 + Math.random()*400), 80, MAP_H - 80),
+    ts: Date.now()
+  };
+  world.customNpcs.push(npc);
+  if (world.customNpcs.length > MAX_NPCS) world.customNpcs.shift();
+  saveWorld();
+  io.emit('world:customNpc', npc);
+  return npc;
+}
+function addPhoto(dataUrl, caption, x, y){
+  const raw = String(dataUrl || '');
+  if (!raw.startsWith('data:image/')) throw new Error('Geçersiz görsel.');
+  if (raw.length > MAX_PHOTO_BYTES) throw new Error('Fotoğraf çok büyük (max ~120KB).');
+  const photo = {
+    id: 'p' + Date.now().toString(36) + Math.random().toString(36).slice(2,5),
+    dataUrl: raw,
+    caption: cleanText(caption, 80),
+    x: clamp(x != null ? x : (MAP_W/2 + (Math.random()-0.5)*300), 80, MAP_W - 80),
+    y: clamp(y != null ? y : (MAP_H/2 + (Math.random()-0.5)*200), 80, MAP_H - 80),
+    ts: Date.now()
+  };
+  world.photos.push(photo);
+  if (world.photos.length > MAX_PHOTOS) world.photos.shift();
+  saveWorld();
+  io.emit('world:photo', { id: photo.id, x: photo.x, y: photo.y, caption: photo.caption, dataUrl: photo.dataUrl });
+  return photo;
+}
+function clearCustomNpcs(){
+  world.customNpcs = [];
+  saveWorld();
+  io.emit('world:customNpcsCleared');
+}
+function clearPhotos(){
+  world.photos = [];
+  saveWorld();
+  io.emit('world:photosCleared');
+}
+
 function pushLog(cmd, summary){
   world.adminLog.push({ ts: Date.now(), cmd: cleanText(cmd, 200), resultSummary: cleanText(summary, 200) });
   if (world.adminLog.length > MAX_LOG) world.adminLog.shift();
@@ -104,87 +160,102 @@ function pushLog(cmd, summary){
 }
 
 // ---- Claude API ile komutu bir oyun eylemine çevir ----
-const ALLOWED_ACTIONS = new Set(['sign', 'toggle_night', 'clear_signs']);
+const ALLOWED_ACTIONS = new Set(['sign', 'toggle_night', 'clear_signs', 'add_npc', 'clear_npcs', 'clear_photos']);
 
-const SYSTEM_PROMPT = `Sen PENIONTALE adlı bir 2D oyunun gizli yönetici panelinin arkasında çalışan bir motor-asistanısın.
-Yönetici sana Türkçe (veya başka bir dilde) serbest metinli bir komut yazacak.
-Bu komutu, oyuna uygulanacak TEK bir JSON eylemine çevir. SADECE geçerli JSON döndür — açıklama, markdown, kod bloğu, tırnak dışı metin YOK.
+const SYSTEM_PROMPT = `Sen PENIONTALE (Hero Kampı) 2D piksel RPG oyununun gizli yönetici motorusun.
+Yönetici Türkçe serbest komut yazar. SADECE tek bir geçerli JSON döndür. Markdown/kod bloğu/açıklama YOK.
 
-İzin verilen eylemler:
-1. {"action":"sign","text":"..."} — Oyun haritasına AI'nin ürettiği kısa (en fazla 140 karakter) bir ilan/duyuru panosu ekler. Bu, "oyuna bir şey ekle" türündeki her komut için varsayılan eylemdir: komutun anlamını oyunun fantastik/sıcak tarzına uygun kısa bir duyuru metnine çevir.
-2. {"action":"toggle_night"} — Sadece komut açıkça gece/gündüz değiştirmeyi istiyorsa kullan.
-3. {"action":"clear_signs"} — Sadece komut açıkça tüm ilanları/panoları temizlemeyi istiyorsa kullan.
+Eylemler:
+1. NPC ekle (öncelik: komut "npc", "karakter", "kişi ekle" diyorsa BUNU kullan, asla sign yapma):
+{"action":"add_npc","name":"İsim","letter":"A","color":"#hex","lines":["diyalog1","diyalog2","diyalog3"]}
+- name zorunlu (max 24). letter 1-2 harf. color CSS hex.
+- lines: 2-4 kısa Türkçe diyalog, oyunun sıcak/fantastik tonunda, karakter kişiliğine uygun.
+- Örnek: "oyunu özetleyen npc ekle" → name:"Anlatıcı", lines oyun özeti gibi.
 
-Emin değilsen ya da komut bu üç tipe net biçimde uymuyorsa, her zaman "sign" eylemini seç ve komutun içeriğini kısa bir duyuru metni haline getir. Böylece her komut oyuna görünür bir şekilde yansır. Yanıtın SADECE JSON olsun, başka hiçbir şey ekleme.`;
+2. İlan/duyuru (sadece ilan, pano, duyuru, yazı isteniyorsa):
+{"action":"sign","text":"kısa duyuru max 140 karakter"}
+
+3. {"action":"toggle_night"} — sadece gece/gündüz denirse.
+
+4. {"action":"clear_signs"} — ilanları temizle.
+5. {"action":"clear_npcs"} — eklenen özel NPC'leri temizle.
+6. {"action":"clear_photos"} — fotoğrafları temizle.
+
+Kural: NPC isteniyorsa add_npc. Sadece "ilan koy" / "duyuru" ise sign. Emin değilsen ve karakter kastediliyorsa add_npc seç.`;
 
 async function interpretCommand(text) {
+  // API yoksa veya her türlü hata: ham metni ilan yap — panel ASLA kilitlenmesin
+  const asSign = () => ({ action: 'sign', text, _fallback: true });
+
   if (!GEMINI_API_KEY) {
-    return { action: 'sign', text, _fallback: 'no_api_key' };
+    console.warn('GEMINI_API_KEY yok — ham ilan');
+    return asSign();
   }
+
   const url = 'https://generativelanguage.googleapis.com/v1beta/models/' + GEMINI_MODEL + ':generateContent?key=' + GEMINI_API_KEY;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-      contents: [{ role: 'user', parts: [{ text: text }] }],
-      generationConfig: {
-        maxOutputTokens: 512,
-        temperature: 0.2,
-        responseMimeType: 'application/json'
-      }
-    })
-  });
+
+  let res;
+  try {
+    res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+        contents: [{ role: 'user', parts: [{ text: text }] }],
+        generationConfig: {
+          maxOutputTokens: 512,
+          temperature: 0.2,
+          responseMimeType: 'application/json'
+        }
+      })
+    });
+  } catch (e) {
+    console.warn('Gemini fetch hata:', e.message);
+    return asSign();
+  }
+
   if (!res.ok) {
     const errBody = await res.text().catch(() => '');
-    // 503 / yoğunluk: AI yokken bile komutu ilan olarak ekle, panel kilitlenmesin
-    if (res.status === 503 || res.status === 429) {
-      console.warn('Gemini yoğun (' + res.status + '), ham ilan fallback');
-      return { action: 'sign', text, _fallback: 'api_' + res.status };
-    }
-    throw new Error('Gemini API hatası ' + res.status + ': ' + errBody.slice(0, 200));
+    console.warn('Gemini HTTP', res.status, errBody.slice(0, 150));
+    // 503 / 429 / 404 / her şey → ilan fallback, kullanıcıya kırmızı hata yok
+    return asSign();
   }
-  const data = await res.json();
+
+  let data;
+  try {
+    data = await res.json();
+  } catch (e) {
+    console.warn('Gemini JSON body okunamadı');
+    return asSign();
+  }
+
   const raw = ((data.candidates || [])[0]?.content?.parts || []).map(p => p.text || '').join('').trim();
-  if (!raw) {
-    return { action: 'sign', text, _fallback: 'empty_response' };
-  }
+  if (!raw) return asSign();
 
   function tryParse(str) {
     try { return JSON.parse(str); } catch (e) { return null; }
   }
 
-  // 1) direkt parse
   let parsed = tryParse(raw);
-
-  // 2) markdown kod bloğu temizle
   if (!parsed) {
     const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
     parsed = tryParse(cleaned);
   }
-
-  // 3) ilk { ... } bloğu
   if (!parsed) {
     const m = raw.match(/\{[\s\S]*\}/);
     if (m) parsed = tryParse(m[0]);
   }
-
-  // 4) yarım JSON: {"action":"sign","text":"...  (kapanmamış)
   if (!parsed) {
-    const m = raw.match(/"action"\s*:\s*"sign"[\s\S]*?"text"\s*:\s*"([^"]*)/);
-    if (m) {
-      parsed = { action: 'sign', text: m[1] || text };
+    const m = raw.match(/"action"\s*:\s*"(\w+)"[\s\S]*?"text"\s*:\s*"([^"]*)/);
+    if (m && ALLOWED_ACTIONS.has(m[1])) {
+      parsed = { action: m[1], text: m[2] || text };
     }
   }
 
-  // 5) hiçbir şey olmazsa ham metni ilan yap
   if (!parsed || !ALLOWED_ACTIONS.has(parsed.action)) {
-    return { action: 'sign', text: (parsed && parsed.text) || text, _fallback: 'parse_fallback' };
+    return asSign();
   }
-
-  if (parsed.action === 'sign' && !parsed.text) {
-    parsed.text = text;
-  }
+  if (parsed.action === 'sign' && !parsed.text) parsed.text = text;
   return parsed;
 }
 
@@ -197,6 +268,10 @@ function applyAction(action) {
       const sign = addSign(action.text, cx, cy);
       return 'İlan eklendi: "' + sign.text + '"';
     }
+    case 'add_npc': {
+      const npc = addCustomNpc(action);
+      return 'NPC eklendi: ' + npc.name + ' (E ile konuş)';
+    }
     case 'toggle_night': {
       world.isNight = !world.isNight;
       saveWorld();
@@ -206,6 +281,14 @@ function applyAction(action) {
     case 'clear_signs': {
       clearSigns();
       return 'Tüm ilanlar temizlendi.';
+    }
+    case 'clear_npcs': {
+      clearCustomNpcs();
+      return "Özel NPC ler temizlendi.";
+    }
+    case 'clear_photos': {
+      clearPhotos();
+      return 'Fotoğraflar temizlendi.';
     }
     default:
       return 'Bilinmeyen eylem.';
@@ -232,7 +315,9 @@ io.on('connection', socket => {
       players: [...players.values()].map(publicPlayer),
       isNight: world.isNight,
       collectedStars: world.collectedStars,
-      signs: world.signs
+      signs: world.signs,
+      customNpcs: world.customNpcs,
+      photos: world.photos
     });
     socket.broadcast.emit('player:joined', publicPlayer(p));
     broadcastPlayers();
@@ -288,13 +373,51 @@ io.on('connection', socket => {
       }
       lastAdminCmdAt.set(socket.id, now);
 
-      const action = await interpretCommand(text);
+      let action;
+      const low = text.toLowerCase();
+      // Hızlı yol: NPC isteniyorsa AI'ye bırakmadan da net istek
+      if (/\b(npc|karakter|kişi ekle|biri ekle)\b/i.test(text) && !/ilan|duyuru|pano|temizle|gece|gündüz/.test(low)) {
+        action = await interpretCommand(text);
+        if (!action || action.action !== 'add_npc') {
+          // AI sign döndürdüyse zorla npc iskeleti
+          action = {
+            action: 'add_npc',
+            name: (action && action.text) ? String(action.text).slice(0, 24) : 'Yeni Karakter',
+            letter: '?',
+            color: '#a29bfe',
+            lines: [
+              'Merhaba. Ben yeni bir kamp sakiniyim.',
+              cleanText(text, 100),
+              'Hero Kampı… ilginç bir yer.'
+            ]
+          };
+          // isim düzelt
+          if (action.name.length > 20 || action.name.includes(' ')) {
+            /* keep */
+          }
+        }
+      } else {
+        action = await interpretCommand(text);
+      }
       const summary = applyAction(action);
       pushLog(text, summary);
       ack({ ok: true, summary, action: action.action });
     } catch (e) {
       console.error('admin:command hata:', e.message);
       ack({ ok: false, error: 'Hata: ' + e.message });
+    }
+  });
+
+
+  socket.on('admin:photo', (data, callback) => {
+    const ack = typeof callback === 'function' ? callback : () => {};
+    try {
+      if (!data || data.pass !== ADMIN_PASS) return ack({ ok: false, error: 'Yanlış şifre.' });
+      const photo = addPhoto(data.dataUrl, data.caption || '', data.x, data.y);
+      pushLog('[foto]', 'Foto eklendi ' + photo.id);
+      ack({ ok: true, summary: 'Fotoğraf haritaya eklendi.' });
+    } catch (e) {
+      ack({ ok: false, error: e.message || 'Foto eklenemedi.' });
     }
   });
 
@@ -310,521 +433,5 @@ server.listen(PORT, () => {
   console.log(`Peniontale multiplayer server: http://localhost:${PORT}`);
   if (!GEMINI_API_KEY) {
     console.warn('UYARI: GEMINI_API_KEY tanımlı değil — admin paneldeki AI, komutları ham ilan metni olarak ekleyecek (Gemini yorumlaması olmadan).');
-  }
-});
-  signs: [],        // [{id, text, x, y, ts}]  -> AI'nin oyuna eklediği kalıcı ilan panoları
-  adminLog: []       // [{ts, cmd, resultSummary}] -> panelde geçmişi görmek için
-};
-
-function loadWorld() {
-  try {
-    const raw = fs.readFileSync(STATE_FILE, 'utf8');
-    const saved = JSON.parse(raw);
-    world.isNight = !!saved.isNight;
-    world.collectedStars = saved.collectedStars || Object.create(null);
-    world.signs = Array.isArray(saved.signs) ? saved.signs : [];
-    world.adminLog = Array.isArray(saved.adminLog) ? saved.adminLog : [];
-  } catch (e) {
-    // Dosya yok veya bozuk — sıfırdan başla.
-  }
-}
-let saveTimer = null;
-function saveWorld() {
-  clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => {
-    try { fs.writeFileSync(STATE_FILE, JSON.stringify(world)); }
-    catch (e) { console.error('world-state.json yazılamadı:', e.message); }
-  }, 250);
-}
-loadWorld();
-
-app.use(express.static(path.join(__dirname)));
-app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'Peniontale_Multiplayer.html')));
-
-function clamp(v, min, max){ return Math.max(min, Math.min(max, Number(v) || 0)); }
-function cleanName(v){
-  const n = String(v || 'Oyuncu').replace(/[<>]/g,'').trim().slice(0,18);
-  return n || 'Oyuncu';
-}
-function cleanText(v, maxLen){
-  return String(v || '').replace(/[<>`]/g,'').replace(/\s+/g,' ').trim().slice(0, maxLen);
-}
-function publicPlayer(p){
-  return { id:p.id, name:p.name, x:p.x, y:p.y, facing:p.facing };
-}
-function broadcastPlayers(){
-  io.emit('world:players', [...players.values()].map(publicPlayer));
-}
-
-function addSign(text, x, y){
-  const sign = {
-    id: 's' + Date.now().toString(36) + Math.random().toString(36).slice(2,6),
-    text: cleanText(text, 140) || '(boş ilan)',
-    x: clamp(x, 60, MAP_W - 60),
-    y: clamp(y, 60, MAP_H - 60),
-    ts: Date.now()
-  };
-  world.signs.push(sign);
-  if (world.signs.length > MAX_SIGNS) world.signs.shift();
-  saveWorld();
-  io.emit('world:sign', sign);
-  return sign;
-}
-function clearSigns(){
-  world.signs = [];
-  saveWorld();
-  io.emit('world:signsCleared');
-}
-function pushLog(cmd, summary){
-  world.adminLog.push({ ts: Date.now(), cmd: cleanText(cmd, 200), resultSummary: cleanText(summary, 200) });
-  if (world.adminLog.length > MAX_LOG) world.adminLog.shift();
-  saveWorld();
-}
-
-// ---- Claude API ile komutu bir oyun eylemine çevir ----
-const ALLOWED_ACTIONS = new Set(['sign', 'toggle_night', 'clear_signs']);
-
-const SYSTEM_PROMPT = `Sen PENIONTALE adlı bir 2D oyunun gizli yönetici panelinin arkasında çalışan bir motor-asistanısın.
-Yönetici sana Türkçe (veya başka bir dilde) serbest metinli bir komut yazacak.
-Bu komutu, oyuna uygulanacak TEK bir JSON eylemine çevir. SADECE geçerli JSON döndür — açıklama, markdown, kod bloğu, tırnak dışı metin YOK.
-
-İzin verilen eylemler:
-1. {"action":"sign","text":"..."} — Oyun haritasına AI'nin ürettiği kısa (en fazla 140 karakter) bir ilan/duyuru panosu ekler. Bu, "oyuna bir şey ekle" türündeki her komut için varsayılan eylemdir: komutun anlamını oyunun fantastik/sıcak tarzına uygun kısa bir duyuru metnine çevir.
-2. {"action":"toggle_night"} — Sadece komut açıkça gece/gündüz değiştirmeyi istiyorsa kullan.
-3. {"action":"clear_signs"} — Sadece komut açıkça tüm ilanları/panoları temizlemeyi istiyorsa kullan.
-
-Emin değilsen ya da komut bu üç tipe net biçimde uymuyorsa, her zaman "sign" eylemini seç ve komutun içeriğini kısa bir duyuru metni haline getir. Böylece her komut oyuna görünür bir şekilde yansır. Yanıtın SADECE JSON olsun, başka hiçbir şey ekleme.`;
-
-async function interpretCommand(text) {
-  if (!GEMINI_API_KEY) {
-    return { action: 'sign', text, _fallback: 'no_api_key' };
-  }
-  const url = 'https://generativelanguage.googleapis.com/v1beta/models/' + GEMINI_MODEL + ':generateContent?key=' + GEMINI_API_KEY;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-      contents: [{ role: 'user', parts: [{ text: text }] }],
-      generationConfig: {
-        maxOutputTokens: 512,
-        temperature: 0.2,
-        responseMimeType: 'application/json'
-      }
-    })
-  });
-  if (!res.ok) {
-    const errBody = await res.text().catch(() => '');
-    throw new Error('Gemini API hatası ' + res.status + ': ' + errBody.slice(0, 200));
-  }
-  const data = await res.json();
-  const raw = ((data.candidates || [])[0]?.content?.parts || []).map(p => p.text || '').join('').trim();
-  if (!raw) {
-    return { action: 'sign', text, _fallback: 'empty_response' };
-  }
-
-  function tryParse(str) {
-    try { return JSON.parse(str); } catch (e) { return null; }
-  }
-
-  // 1) direkt parse
-  let parsed = tryParse(raw);
-
-  // 2) markdown kod bloğu temizle
-  if (!parsed) {
-    const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
-    parsed = tryParse(cleaned);
-  }
-
-  // 3) ilk { ... } bloğu
-  if (!parsed) {
-    const m = raw.match(/\{[\s\S]*\}/);
-    if (m) parsed = tryParse(m[0]);
-  }
-
-  // 4) yarım JSON: {"action":"sign","text":"...  (kapanmamış)
-  if (!parsed) {
-    const m = raw.match(/"action"\s*:\s*"sign"[\s\S]*?"text"\s*:\s*"([^"]*)/);
-    if (m) {
-      parsed = { action: 'sign', text: m[1] || text };
-    }
-  }
-
-  // 5) hiçbir şey olmazsa ham metni ilan yap
-  if (!parsed || !ALLOWED_ACTIONS.has(parsed.action)) {
-    return { action: 'sign', text: (parsed && parsed.text) || text, _fallback: 'parse_fallback' };
-  }
-
-  if (parsed.action === 'sign' && !parsed.text) {
-    parsed.text = text;
-  }
-  return parsed;
-}
-
-function applyAction(action) {
-  switch (action.action) {
-    case 'sign': {
-      const angle = Math.random() * Math.PI * 2;
-      const cx = MAP_W / 2 + Math.cos(angle) * 260;
-      const cy = MAP_H / 2 + Math.sin(angle) * 180;
-      const sign = addSign(action.text, cx, cy);
-      return 'İlan eklendi: "' + sign.text + '"';
-    }
-    case 'toggle_night': {
-      world.isNight = !world.isNight;
-      saveWorld();
-      io.emit('world:night', { isNight: world.isNight, by: 'admin' });
-      return world.isNight ? 'Geceye çevrildi.' : 'Gündüze çevrildi.';
-    }
-    case 'clear_signs': {
-      clearSigns();
-      return 'Tüm ilanlar temizlendi.';
-    }
-    default:
-      return 'Bilinmeyen eylem.';
-  }
-}
-
-// Basit hız sınırlama: aynı bağlantı 4 saniyede bir komut gönderebilir.
-const lastAdminCmdAt = new Map();
-
-io.on('connection', socket => {
-  socket.on('player:join', data => {
-    if(players.has(socket.id)) return;
-    const p = {
-      id: socket.id,
-      name: cleanName(data?.name),
-      x: clamp(data?.x, 40, MAP_W - 82),
-      y: clamp(data?.y, 40, MAP_H - 100),
-      facing: ['up','down','left','right'].includes(data?.facing) ? data.facing : 'down'
-    };
-    players.set(socket.id, p);
-
-    socket.emit('world:init', {
-      you: socket.id,
-      players: [...players.values()].map(publicPlayer),
-      isNight: world.isNight,
-      collectedStars: world.collectedStars,
-      signs: world.signs
-    });
-    socket.broadcast.emit('player:joined', publicPlayer(p));
-    broadcastPlayers();
-  });
-
-  socket.on('player:move', data => {
-    const p=players.get(socket.id);
-    if(!p) return;
-    p.x=clamp(data?.x,40,MAP_W-82);
-    p.y=clamp(data?.y,40,MAP_H-100);
-    if(['up','down','left','right'].includes(data?.facing)) p.facing=data.facing;
-    socket.broadcast.emit('player:moved', publicPlayer(p));
-  });
-
-  socket.on('player:action', data => {
-    const p=players.get(socket.id);
-    if(!p) return;
-    const text=String(data?.text || '').replace(/[<>]/g,'').slice(0,32);
-    if(text) io.emit('world:playerAction',{id:p.id,name:p.name,text});
-  });
-
-  socket.on('world:toggleNight', () => {
-    if(!players.has(socket.id)) return;
-    world.isNight=!world.isNight;
-    saveWorld();
-    io.emit('world:night',{isNight:world.isNight,by:socket.id});
-  });
-
-  socket.on('world:collectStar', data => {
-    if(!players.has(socket.id)) return;
-    const id=String(data?.starId || '');
-    if(!['1','2','3'].includes(id)) return;
-    if(world.collectedStars[id]) return;
-    world.collectedStars[id]=true;
-    saveWorld();
-    io.emit('world:star',{starId:id,by:socket.id});
-  });
-
-  // ---- Gizli panel: AI ile oyuna kalıcı ekleme yapma ----
-  socket.on('admin:command', async (data, callback) => {
-    const ack = typeof callback === 'function' ? callback : () => {};
-    try {
-      if (!data || data.pass !== ADMIN_PASS) {
-        return ack({ ok: false, error: 'Yanlış şifre.' });
-      }
-      const text = cleanText(data.text, 400);
-      if (!text) return ack({ ok: false, error: 'Boş komut.' });
-
-      const now = Date.now();
-      const last = lastAdminCmdAt.get(socket.id) || 0;
-      if (now - last < 4000) {
-        return ack({ ok: false, error: 'Çok hızlı — birkaç saniye bekle.' });
-      }
-      lastAdminCmdAt.set(socket.id, now);
-
-      const action = await interpretCommand(text);
-      const summary = applyAction(action);
-      pushLog(text, summary);
-      ack({ ok: true, summary, action: action.action });
-    } catch (e) {
-      console.error('admin:command hata:', e.message);
-      ack({ ok: false, error: 'Hata: ' + e.message });
-    }
-  });
-
-  socket.on('disconnect', () => {
-    if(players.delete(socket.id)) {
-      socket.broadcast.emit('player:left',{id:socket.id});
-      broadcastPlayers();
-    }
-  });
-});
-
-server.listen(PORT, () => {
-  console.log(`Peniontale multiplayer server: http://localhost:${PORT}`);
-  if (!GEMINI_API_KEY) {
-    console.warn('UYARI: GEMINI_API_KEY tanımlı değil — admin paneldeki AI, komutları ham ilan metni olarak ekleyecek (Gemini yorumlaması olmadan).');
-  }
-});
-  adminLog: []       // [{ts, cmd, resultSummary}] -> panelde geçmişi görmek için
-};
-
-function loadWorld() {
-  try {
-    const raw = fs.readFileSync(STATE_FILE, 'utf8');
-    const saved = JSON.parse(raw);
-    world.isNight = !!saved.isNight;
-    world.collectedStars = saved.collectedStars || Object.create(null);
-    world.signs = Array.isArray(saved.signs) ? saved.signs : [];
-    world.adminLog = Array.isArray(saved.adminLog) ? saved.adminLog : [];
-  } catch (e) {
-    // Dosya yok veya bozuk — sıfırdan başla.
-  }
-}
-let saveTimer = null;
-function saveWorld() {
-  clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => {
-    try { fs.writeFileSync(STATE_FILE, JSON.stringify(world)); }
-    catch (e) { console.error('world-state.json yazılamadı:', e.message); }
-  }, 250);
-}
-loadWorld();
-
-app.use(express.static(path.join(__dirname)));
-app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'Peniontale_Multiplayer.html')));
-
-function clamp(v, min, max){ return Math.max(min, Math.min(max, Number(v) || 0)); }
-function cleanName(v){
-  const n = String(v || 'Oyuncu').replace(/[<>]/g,'').trim().slice(0,18);
-  return n || 'Oyuncu';
-}
-function cleanText(v, maxLen){
-  return String(v || '').replace(/[<>`]/g,'').replace(/\s+/g,' ').trim().slice(0, maxLen);
-}
-function publicPlayer(p){
-  return { id:p.id, name:p.name, x:p.x, y:p.y, facing:p.facing };
-}
-function broadcastPlayers(){
-  io.emit('world:players', [...players.values()].map(publicPlayer));
-}
-
-function addSign(text, x, y){
-  const sign = {
-    id: 's' + Date.now().toString(36) + Math.random().toString(36).slice(2,6),
-    text: cleanText(text, 140) || '(boş ilan)',
-    x: clamp(x, 60, MAP_W - 60),
-    y: clamp(y, 60, MAP_H - 60),
-    ts: Date.now()
-  };
-  world.signs.push(sign);
-  if (world.signs.length > MAX_SIGNS) world.signs.shift();
-  saveWorld();
-  io.emit('world:sign', sign);
-  return sign;
-}
-function clearSigns(){
-  world.signs = [];
-  saveWorld();
-  io.emit('world:signsCleared');
-}
-function pushLog(cmd, summary){
-  world.adminLog.push({ ts: Date.now(), cmd: cleanText(cmd, 200), resultSummary: cleanText(summary, 200) });
-  if (world.adminLog.length > MAX_LOG) world.adminLog.shift();
-  saveWorld();
-}
-
-// ---- Claude API ile komutu bir oyun eylemine çevir ----
-const ALLOWED_ACTIONS = new Set(['sign', 'toggle_night', 'clear_signs']);
-
-const SYSTEM_PROMPT = `Sen PENIONTALE adlı bir 2D oyunun gizli yönetici panelinin arkasında çalışan bir motor-asistanısın.
-Yönetici sana Türkçe (veya başka bir dilde) serbest metinli bir komut yazacak.
-Bu komutu, oyuna uygulanacak TEK bir JSON eylemine çevir. SADECE geçerli JSON döndür — açıklama, markdown, kod bloğu, tırnak dışı metin YOK.
-
-İzin verilen eylemler:
-1. {"action":"sign","text":"..."} — Oyun haritasına AI'nin ürettiği kısa (en fazla 140 karakter) bir ilan/duyuru panosu ekler. Bu, "oyuna bir şey ekle" türündeki her komut için varsayılan eylemdir: komutun anlamını oyunun fantastik/sıcak tarzına uygun kısa bir duyuru metnine çevir.
-2. {"action":"toggle_night"} — Sadece komut açıkça gece/gündüz değiştirmeyi istiyorsa kullan.
-3. {"action":"clear_signs"} — Sadece komut açıkça tüm ilanları/panoları temizlemeyi istiyorsa kullan.
-
-Emin değilsen ya da komut bu üç tipe net biçimde uymuyorsa, her zaman "sign" eylemini seç ve komutun içeriğini kısa bir duyuru metni haline getir. Böylece her komut oyuna görünür bir şekilde yansır. Yanıtın SADECE JSON olsun, başka hiçbir şey ekleme.`;
-
-async function interpretCommand(text) {
-  if (!ANTHROPIC_API_KEY) {
-    // API anahtarı yoksa: en azından ham metni doğrudan ilan olarak ekle, sistem çökmesin.
-    return { action: 'sign', text, _fallback: 'no_api_key' };
-  }
-  const res = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': ANTHROPIC_API_KEY,
-      'anthropic-version': '2023-06-01'
-    },
-    body: JSON.stringify({
-      model: ANTHROPIC_MODEL,
-      max_tokens: 300,
-      system: SYSTEM_PROMPT,
-      messages: [{ role: 'user', content: text }]
-    })
-  });
-  if (!res.ok) {
-    const errBody = await res.text().catch(() => '');
-    throw new Error('Claude API hatası ' + res.status + ': ' + errBody.slice(0, 200));
-  }
-  const data = await res.json();
-  const raw = (data.content || []).map(b => b.text || '').join('').trim();
-  const jsonMatch = raw.match(/\{[\s\S]*\}/);
-  if (!jsonMatch) throw new Error('Claude JSON döndürmedi: ' + raw.slice(0, 120));
-  let parsed;
-  try { parsed = JSON.parse(jsonMatch[0]); }
-  catch (e) { throw new Error('JSON parse edilemedi: ' + raw.slice(0, 120)); }
-  if (!parsed || !ALLOWED_ACTIONS.has(parsed.action)) {
-    // Beklenmeyen bir şey döndüyse yine de kaybetme, ilan olarak ekle.
-    return { action: 'sign', text, _fallback: 'invalid_action' };
-  }
-  return parsed;
-}
-
-function applyAction(action) {
-  switch (action.action) {
-    case 'sign': {
-      const angle = Math.random() * Math.PI * 2;
-      const cx = MAP_W / 2 + Math.cos(angle) * 260;
-      const cy = MAP_H / 2 + Math.sin(angle) * 180;
-      const sign = addSign(action.text, cx, cy);
-      return 'İlan eklendi: "' + sign.text + '"';
-    }
-    case 'toggle_night': {
-      world.isNight = !world.isNight;
-      saveWorld();
-      io.emit('world:night', { isNight: world.isNight, by: 'admin' });
-      return world.isNight ? 'Geceye çevrildi.' : 'Gündüze çevrildi.';
-    }
-    case 'clear_signs': {
-      clearSigns();
-      return 'Tüm ilanlar temizlendi.';
-    }
-    default:
-      return 'Bilinmeyen eylem.';
-  }
-}
-
-// Basit hız sınırlama: aynı bağlantı 4 saniyede bir komut gönderebilir.
-const lastAdminCmdAt = new Map();
-
-io.on('connection', socket => {
-  socket.on('player:join', data => {
-    if(players.has(socket.id)) return;
-    const p = {
-      id: socket.id,
-      name: cleanName(data?.name),
-      x: clamp(data?.x, 40, MAP_W - 82),
-      y: clamp(data?.y, 40, MAP_H - 100),
-      facing: ['up','down','left','right'].includes(data?.facing) ? data.facing : 'down'
-    };
-    players.set(socket.id, p);
-
-    socket.emit('world:init', {
-      you: socket.id,
-      players: [...players.values()].map(publicPlayer),
-      isNight: world.isNight,
-      collectedStars: world.collectedStars,
-      signs: world.signs
-    });
-    socket.broadcast.emit('player:joined', publicPlayer(p));
-    broadcastPlayers();
-  });
-
-  socket.on('player:move', data => {
-    const p=players.get(socket.id);
-    if(!p) return;
-    p.x=clamp(data?.x,40,MAP_W-82);
-    p.y=clamp(data?.y,40,MAP_H-100);
-    if(['up','down','left','right'].includes(data?.facing)) p.facing=data.facing;
-    socket.broadcast.emit('player:moved', publicPlayer(p));
-  });
-
-  socket.on('player:action', data => {
-    const p=players.get(socket.id);
-    if(!p) return;
-    const text=String(data?.text || '').replace(/[<>]/g,'').slice(0,32);
-    if(text) io.emit('world:playerAction',{id:p.id,name:p.name,text});
-  });
-
-  socket.on('world:toggleNight', () => {
-    if(!players.has(socket.id)) return;
-    world.isNight=!world.isNight;
-    saveWorld();
-    io.emit('world:night',{isNight:world.isNight,by:socket.id});
-  });
-
-  socket.on('world:collectStar', data => {
-    if(!players.has(socket.id)) return;
-    const id=String(data?.starId || '');
-    if(!['1','2','3'].includes(id)) return;
-    if(world.collectedStars[id]) return;
-    world.collectedStars[id]=true;
-    saveWorld();
-    io.emit('world:star',{starId:id,by:socket.id});
-  });
-
-  // ---- Gizli panel: AI ile oyuna kalıcı ekleme yapma ----
-  socket.on('admin:command', async (data, callback) => {
-    const ack = typeof callback === 'function' ? callback : () => {};
-    try {
-      if (!data || data.pass !== ADMIN_PASS) {
-        return ack({ ok: false, error: 'Yanlış şifre.' });
-      }
-      const text = cleanText(data.text, 400);
-      if (!text) return ack({ ok: false, error: 'Boş komut.' });
-
-      const now = Date.now();
-      const last = lastAdminCmdAt.get(socket.id) || 0;
-      if (now - last < 4000) {
-        return ack({ ok: false, error: 'Çok hızlı — birkaç saniye bekle.' });
-      }
-      lastAdminCmdAt.set(socket.id, now);
-
-      const action = await interpretCommand(text);
-      const summary = applyAction(action);
-      pushLog(text, summary);
-      ack({ ok: true, summary, action: action.action });
-    } catch (e) {
-      console.error('admin:command hata:', e.message);
-      ack({ ok: false, error: 'Hata: ' + e.message });
-    }
-  });
-
-  socket.on('disconnect', () => {
-    if(players.delete(socket.id)) {
-      socket.broadcast.emit('player:left',{id:socket.id});
-      broadcastPlayers();
-    }
-  });
-});
-
-server.listen(PORT, () => {
-  console.log(`Peniontale multiplayer server: http://localhost:${PORT}`);
-  if (!ANTHROPIC_API_KEY) {
-    console.warn('UYARI: ANTHROPIC_API_KEY tanımlı değil — admin paneldeki AI, komutları ham ilan metni olarak ekleyecek (Claude yorumlaması olmadan).');
   }
 });
