@@ -45,24 +45,31 @@ let world = {
 
 function loadWorld() {
   try {
-    const raw = fs.readFileSync(STATE_FILE, 'utf8');
-    const saved = JSON.parse(raw);
-    world.isNight = !!saved.isNight;
-    world.collectedStars = saved.collectedStars || Object.create(null);
-    world.signs = Array.isArray(saved.signs) ? saved.signs : [];
-    world.customNpcs = Array.isArray(saved.customNpcs) ? saved.customNpcs : [];
-    world.photos = Array.isArray(saved.photos) ? saved.photos : [];
-    world.adminLog = Array.isArray(saved.adminLog) ? saved.adminLog : [];
+    if (fs.existsSync(STATE_FILE)) {
+      const raw = fs.readFileSync(STATE_FILE, 'utf8');
+      const saved = JSON.parse(raw);
+      world.isNight = !!saved.isNight;
+      world.collectedStars = saved.collectedStars || Object.create(null);
+      world.signs = Array.isArray(saved.signs) ? saved.signs : [];
+      world.customNpcs = Array.isArray(saved.customNpcs) ? saved.customNpcs : [];
+      world.photos = Array.isArray(saved.photos) ? saved.photos : [];
+      world.adminLog = Array.isArray(saved.adminLog) ? saved.adminLog : [];
+    }
   } catch (e) {
-    // Dosya yok veya bozuk — sıfırdan başla.
+    console.warn('world-state.json okunamadı, varsayılan dünya ile başlanıyor:', e.message);
   }
 }
+
 let saveTimer = null;
 function saveWorld() {
   clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
-    try { fs.writeFileSync(STATE_FILE, JSON.stringify(world)); }
-    catch (e) { console.error('world-state.json yazılamadı:', e.message); }
+    try { 
+      fs.writeFileSync(STATE_FILE, JSON.stringify(world)); 
+    } catch (e) { 
+      // Render salt okunur disk uyarısı - uygulamanın çökmesini engeller
+      console.warn('world-state.json disk üzerine yazılamadı (geçici hafızada tutuluyor):', e.message); 
+    }
   }, 250);
 }
 loadWorld();
@@ -184,7 +191,6 @@ Eylemler:
 Kural: NPC isteniyorsa add_npc. Sadece "ilan koy" / "duyuru" ise sign. Emin değilsen ve karakter kastediliyorsa add_npc seç.`;
 
 async function interpretCommand(text) {
-  // API yoksa veya her türlü hata: ham metni ilan yap — panel ASLA kilitlenmesin
   const asSign = () => ({ action: 'sign', text, _fallback: true });
 
   if (!GEMINI_API_KEY) {
@@ -217,7 +223,6 @@ async function interpretCommand(text) {
   if (!res.ok) {
     const errBody = await res.text().catch(() => '');
     console.warn('Gemini HTTP', res.status, errBody.slice(0, 150));
-    // 503 / 429 / 404 / her şey → ilan fallback, kullanıcıya kırmızı hata yok
     return asSign();
   }
 
@@ -375,11 +380,9 @@ io.on('connection', socket => {
 
       let action;
       const low = text.toLowerCase();
-      // Hızlı yol: NPC isteniyorsa AI'ye bırakmadan da net istek
       if (/\b(npc|karakter|kişi ekle|biri ekle)\b/i.test(text) && !/ilan|duyuru|pano|temizle|gece|gündüz/.test(low)) {
         action = await interpretCommand(text);
         if (!action || action.action !== 'add_npc') {
-          // AI sign döndürdüyse zorla npc iskeleti
           action = {
             action: 'add_npc',
             name: (action && action.text) ? String(action.text).slice(0, 24) : 'Yeni Karakter',
@@ -391,10 +394,6 @@ io.on('connection', socket => {
               'Hero Kampı… ilginç bir yer.'
             ]
           };
-          // isim düzelt
-          if (action.name.length > 20 || action.name.includes(' ')) {
-            /* keep */
-          }
         }
       } else {
         action = await interpretCommand(text);
@@ -407,7 +406,6 @@ io.on('connection', socket => {
       ack({ ok: false, error: 'Hata: ' + e.message });
     }
   });
-
 
   socket.on('admin:photo', (data, callback) => {
     const ack = typeof callback === 'function' ? callback : () => {};
@@ -429,9 +427,11 @@ io.on('connection', socket => {
   });
 });
 
-server.listen(PORT, () => {
-  console.log(`Peniontale multiplayer server: http://localhost:${PORT}`);
+// CRITICAL FIX: Host parametresi olarak '0.0.0.0' açıkça eklendi
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`Peniontale multiplayer server yayında: port ${PORT}`);
   if (!GEMINI_API_KEY) {
-    console.warn('UYARI: GEMINI_API_KEY tanımlı değil — admin paneldeki AI, komutları ham ilan metni olarak ekleyecek (Gemini yorumlaması olmadan).');
+    console.warn('UYARI: GEMINI_API_KEY tanımlı değil — admin paneldeki AI, komutları ham ilan metni olarak ekleyecek.');
   }
 });
+    
