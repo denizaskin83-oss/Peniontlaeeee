@@ -70,7 +70,9 @@ function saveWorld() {
 loadWorld();
 
 app.use(express.static(path.join(__dirname)));
-app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'Peniontale_Multiplayer.html')));
+// Ana sayfa dosya adı (GitHub'daki HTML adıyla aynı olmalı)
+const HTML_FILE = process.env.HTML_FILE || 'Peniontale_Multiplayer-17.html';
+app.get('/', (req, res) => res.sendFile(path.join(__dirname, HTML_FILE)));
 
 function clamp(v, min, max){ return Math.max(min, Math.min(max, Number(v) || 0)); }
 function cleanName(v){
